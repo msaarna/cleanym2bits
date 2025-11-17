@@ -1,6 +1,6 @@
 # CLEANYM2BITS ADPCM Encoder/Decoder
 
-CLEANYM2BITS is a project that implements a 2-bit YM ADPCM variant encoder and decoder. The encoder features a highly advanced, exhaustive recursive look-ahead optimization that significantly improves audio quality compared to standard ADPCM algorithms, especially for devices with extremely low bandwidth or storage capabilities.
+CLEANYM2BITS is a project that implements a 2-bit YM ADPCM variant encoder and decoder. The encoder features an exhaustive recursive look-ahead optimization that significantly improves audio quality compared to standard ADPCM algorithms, especially for devices with extremely low bandwidth or storage capabilities.
 
 This project is a 2-bit variant of the original 4-bit CLEANYM encoder.
 
