@@ -1,4 +1,4 @@
-#define PROGNAME "CLEANYM2 Encoder v1.0, by Mike Saarna. 2025."
+#define PROGNAME "CLEANYM2 Encoder v1.1, by Mike Saarna. 2025."
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,9 +13,9 @@
 
 #define SYNC_QUALITY SRC_SINC_MEDIUM_QUALITY
 
-#define LOOKAHEAD_DEPTH 3
-// ^- The number of samples to consider for lookahead optimisation.
-// With an exhaustive search, 3 samples (4^3=64 paths) is a good balance.
+// Default Lookahead. Now variable via -L.
+int g_lookahead_depth = 3;
+#define MAX_LOOKAHEAD_DEPTH 6
 
 // Weights for the enhanced psychoacoustic error metric.
 #define ERROR_WEIGHT_ABSOLUTE   1.00f
@@ -23,9 +23,9 @@
 
 long TARGETRATE = 32160;
 
-#include <unistd.h>
-
 #define CLAMP(x, low, high)  (((x) > (high)) ? (high) : (((x) < (low)) ? (low) : (x)))
+
+#include <unistd.h>
 
 #define FRAMESIZE 64
 long SAMPLERATE;
@@ -38,22 +38,40 @@ int64_t samplecount;
 float *samplebuffer = NULL;
 FILE *outfile;
 
+// --- Biquad Filter Structures ---
+typedef struct {
+    float a0, a1, a2, b0, b1, b2;
+    float z1, z2;
+} Biquad;
+
+// Global Vocal Priority Factor (set via -V)
+float vocalPriorityFactor = 0.0f;
+
 int loadwave (char *filename, int preserveRate);
 void usage (char *programname);
 float getbitrate (long noisescore, int64_t samplecount);
 float normalizeSample (float *normBuffer, int64_t normBufferSize);
+void normalize_buffer_to_peak (float *buffer, int64_t num_samples, float target_peak);
+
 void apply_hipass_filter_to_buffer (float *buffer, int num_samples, float cutoff_freq_hz, float sample_rate_hz);
+void apply_lowpass_filter_to_buffer (float *buffer, int num_samples, float cutoff_freq_hz, float sample_rate_hz);
+void apply_soft_clip_to_buffer (float *buffer, int64_t num_samples);
+void apply_dynamic_lowpass_filter (float *buffer, int64_t num_samples, float min_freq, float max_freq, float sample_rate);
+void apply_slew_limiter (float *buffer, int64_t num_samples, float slew_factor);
+void apply_mid_scoop (float *buffer, int64_t num_samples, float db_cut, float sample_rate);
+void apply_compressor (float *buffer, int64_t num_samples, float ratio, float threshold_db, float sample_rate);
+
 float returnMedianValue (float a, float b, float c, float d, float e);
 int compare_floats (const void *a, const void *b);
 
 uint8_t encodesample_ym2 (int16_t RawSample);
 int16_t decodesample_ym2 (uint8_t AdpcmSample);
-uint8_t encodesample_ym2_lookahead (int64_t current_sample_index, int16_t CurrentRawSample, long lookbehind_error);
+uint8_t encodesample_ym2_lookahead (int64_t current_sample_index, int16_t CurrentRawSample, long lookbehind_error, float lookbehind_smoothed_error);
 
 // New helper for state-agnostic simulation
 int16_t decodesample_ym2_simulate(uint8_t AdpcmSample, int16_t initial_step_size, int32_t initial_history, int16_t *out_next_step_size, int32_t *out_next_history);
 // New recursive helper for exhaustive search
-float find_best_future_score(int64_t sample_index, int depth, long previous_error, int16_t current_step_size, int32_t current_history);
+float find_best_future_score(int64_t sample_index, int depth, long previous_error, float previous_smoothed_error, int16_t current_step_size, int32_t current_history);
 
 void save_all (void);
 void save_encoder_state (void);
@@ -72,7 +90,8 @@ long fixcount = 0;
 int8_t volumeDivisor = 1;
 
 // Max slew rate default. Smaller values = more aggressive limiting.
-float max_slew_rate_factor = 0.75f;
+// Used if -S is passed without argument, or as base.
+float max_slew_rate_factor = 0.20f; 
 
 // step table used for 2-bit Encoder and Decoder
 const int step_table_2bit[2] = { 235, 341 };
@@ -98,6 +117,10 @@ static float hp_x_prev = 0.0f;	// Previous input sample x[n-1]
 static float hp_y_prev = 0.0f;	// Previous output sample y[n-1]
 static float hp_alpha = 0.0f;	// Filter coefficient, calculated once
 
+// Low-pass filter state
+static float lp_y_prev = 0.0f;
+static float lp_alpha = 0.0f;
+
 int main (int argc, char **argv)
 {
     int c;
@@ -107,13 +130,33 @@ int main (int argc, char **argv)
     int errflg = 0;
 
     int preserveRate = 0;
+    int enableSoftClip = 0;
+    float lpfCutoff = 0.0f;
+    
+    // Dynamic LPF params
+    float dynLpfMin = 0.0f;
+    float dynLpfMax = 0.0f;
+    int dynLpfEnabled = 0;
+
+    // Slew Limiter params
+    float slewFactor = 0.0f;
+
+    // Mid Scoop params
+    float midScoopDb = 0.0f;
+    
+    // Compressor
+    float compRatio = 0.0f;
+
+    // Preset flags
+    int presetMusic = 0;
 
     char *infilename, *outfilename;
 
     infilename = NULL;
     outfilename = NULL;
 
-    while ((c = getopt (argc, argv, ":i:o:f:r:R")) != -1)	// getopt string unchanged
+    // Added L: (Lookahead), C: (Compressor), p: (Preset)
+    while ((c = getopt (argc, argv, ":i:o:f:r:Rsl:D:S:M:V:L:C:p:")) != -1)
     {
 	switch (c)
 	{
@@ -129,6 +172,63 @@ int main (int argc, char **argv)
 	case 'R':
 	    preserveRate = 1;
 	    break;
+    case 's':
+        enableSoftClip = 1;
+        break;
+    case 'l':
+        lpfCutoff = atof(optarg);
+        break;
+    case 'D':
+        {
+            char *comma = strchr(optarg, ',');
+            if (comma) {
+                *comma = '\0';
+                dynLpfMin = atof(optarg);
+                dynLpfMax = atof(comma + 1);
+                dynLpfEnabled = 1;
+            } else {
+                fprintf(stderr, "Error: -D requires format MIN_FREQ,MAX_FREQ (e.g. -D 3000,12000)\n");
+                errflg++;
+            }
+        }
+        break;
+    case 'S':
+        slewFactor = atof(optarg);
+        break;
+    case 'M':
+        midScoopDb = atof(optarg); // e.g., 6.0 for 6dB cut
+        break;
+    case 'V':
+        vocalPriorityFactor = atof(optarg); // e.g., 5.0 for strong vocal priority
+        break;
+    case 'L':
+        g_lookahead_depth = atoi(optarg);
+        if (g_lookahead_depth < 1) g_lookahead_depth = 1;
+        if (g_lookahead_depth > MAX_LOOKAHEAD_DEPTH) g_lookahead_depth = MAX_LOOKAHEAD_DEPTH;
+        break;
+    case 'C':
+        compRatio = atof(optarg); // e.g., 4.0
+        break;
+    case 'p':
+        if (strcmp(optarg, "music") == 0) {
+            // Music: Vocal Priority, Soft Clip, LPF (70% Nyquist)
+            vocalPriorityFactor = 10.0f;
+            enableSoftClip = 1;
+            presetMusic = 1; // LPF calculated later
+        } else if (strcmp(optarg, "deep") == 0) {
+            // Deep: High lookahead
+            g_lookahead_depth = 5;
+        } else if (strcmp(optarg, "speech") == 0) {
+            // Speech: High Vocal Priority, Compressor, Mid Scoop
+            vocalPriorityFactor = 15.0f;
+            compRatio = 4.0f;
+            midScoopDb = 3.0f;
+            enableSoftClip = 1;
+        } else {
+            fprintf(stderr, "Unknown preset: %s\n", optarg);
+            errflg++;
+        }
+        break;
 	case ':':
 	    fprintf (stderr, "*** ERR: option -%c requires an operand\n", optopt);
 	    errflg++;
@@ -173,8 +273,57 @@ int main (int argc, char **argv)
 	return 1;
     }
 
-    // At this point the input WAV file has been loaded and converted 
-    // into floats, ranging from -32512 to 32512
+    // Apply preset logic that depends on final sample rate
+    if (presetMusic && lpfCutoff == 0.0f) {
+        lpfCutoff = (float)TARGETRATE * 0.5f * 0.8f;
+        printf("Preset 'music' set LPF to %.0f Hz\n", lpfCutoff);
+    }
+
+    // --- Pre-processing Stage ---
+    // Order matters:
+    // 1. Mid Scoop (Hollow out the complex middle)
+    // 2. Compressor (Control dynamics early)
+    // 3. LPF (Shape the tone)
+    // 4. Slew Limiter (Enforce limits)
+    // 5. Soft Clip (Catch peaks)
+
+    if (midScoopDb > 0.0f)
+    {
+        printf("Applying Mid-Range Scoop (-%.1fdB at 1kHz)...\n", midScoopDb);
+        apply_mid_scoop(samplebuffer, samplecount, midScoopDb, (float)TARGETRATE);
+    }
+
+    if (compRatio > 1.0f)
+    {
+        printf("Applying Compressor (Ratio %.1f:1)...\n", compRatio);
+        // Threshold fixed at -12dB for general utility
+        apply_compressor(samplebuffer, samplecount, compRatio, -12.0f, (float)TARGETRATE);
+    }
+
+    if (dynLpfEnabled)
+    {
+        printf("Applying Dynamic Low-Pass Filter (%.0fHz - %.0fHz)...\n", dynLpfMin, dynLpfMax);
+        apply_dynamic_lowpass_filter(samplebuffer, samplecount, dynLpfMin, dynLpfMax, (float)TARGETRATE);
+    }
+    else if (lpfCutoff > 0.0f)
+    {
+        printf("Applying Static Low-Pass Filter at %.0f Hz...\n", lpfCutoff);
+        apply_lowpass_filter_to_buffer(samplebuffer, samplecount, lpfCutoff, (float)TARGETRATE);
+    }
+
+    if (slewFactor > 0.0f)
+    {
+        printf("Applying Slew Rate Limiter (Factor: %.2f)...\n", slewFactor);
+        apply_slew_limiter(samplebuffer, samplecount, slewFactor);
+    }
+
+    if (enableSoftClip)
+    {
+        printf("Applying Soft Clip (Tanh Limiter)...\n");
+        apply_soft_clip_to_buffer(samplebuffer, samplecount);
+    }
+
+    // --- End Pre-processing ---
 
     outfile = fopen (outfilename, "wb");
     if (outfile == NULL)
@@ -189,6 +338,7 @@ int main (int argc, char **argv)
     uint8_t AdpcmSamplePacked = 0;
     int16_t SourcePcmSample, PcmSample;
     long last_actual_error = 0; // For look-behind error tracking.
+    float last_smoothed_error = 0.0f; // For Vocal Priority noise shaping
 
     float *frame_distortions = calloc ((samplecount / FRAMESIZE) + 1, sizeof (float));
     if (frame_distortions == NULL)
@@ -199,6 +349,8 @@ int main (int argc, char **argv)
 	    free (samplebuffer);
 	return 1;
     }
+    
+    printf("Encoding with Lookahead Depth: %d\n", g_lookahead_depth);
 
     for (t = 0; t < samplecount; t++)
     {
@@ -225,7 +377,7 @@ int main (int argc, char **argv)
 	if (t < samplecount - 1)
 	{	// If there's at least one next sample for lookahead
         // Pass the last actual error to the lookahead function.
-	    AdpcmSample = encodesample_ym2_lookahead (t, SourcePcmSample, last_actual_error);
+	    AdpcmSample = encodesample_ym2_lookahead (t, SourcePcmSample, last_actual_error, last_smoothed_error);
 	}
 	else
 	{	// For the very last sample, no lookahead is possible with this scheme; use normal encoder.
@@ -241,10 +393,15 @@ int main (int argc, char **argv)
 	PcmSample = (int16_t) decodesample_ym2 (AdpcmSample);
 
     // Calculate and store the actual error for the next iteration's look-behind.
-    last_actual_error = (long)PcmSample - (long)SourcePcmSample;
+    long current_error = (long)PcmSample - (long)SourcePcmSample;
+    last_actual_error = current_error;
 
-	noisescore += abs (PcmSample - SourcePcmSample);
-	framenoise += abs (PcmSample - SourcePcmSample);
+    // Update the smoothed error (Low-Pass Filter on the error signal)
+    // Alpha 0.15 gives a good balance for vocal range tracking
+    last_smoothed_error = last_smoothed_error + 0.15f * ((float)current_error - last_smoothed_error);
+
+	noisescore += abs (current_error);
+	framenoise += abs (current_error);
 
     // Pack four 2-bit samples into a byte.
     // The bits are packed in the order they are processed.
@@ -348,11 +505,11 @@ int16_t decodesample_ym2_simulate(uint8_t AdpcmSample, int16_t initial_step_size
     return (int16_t)current_history;
 }
 
-// Recursively finds the minimum possible psychoacoustic score for a path of LOOKAHEAD_DEPTH.
-float find_best_future_score(int64_t sample_index, int depth, long previous_error, int16_t current_step_size, int32_t current_history)
+// Recursively finds the minimum possible psychoacoustic score for a path of g_lookahead_depth.
+float find_best_future_score(int64_t sample_index, int depth, long previous_error, float previous_smoothed_error, int16_t current_step_size, int32_t current_history)
 {
     // Base case: If we've looked far enough ahead or are at the end of the sample, stop.
-    if (depth >= LOOKAHEAD_DEPTH || sample_index >= samplecount) {
+    if (depth >= g_lookahead_depth || sample_index >= samplecount) {
         return 0.0f;
     }
 
@@ -367,12 +524,24 @@ float find_best_future_score(int64_t sample_index, int depth, long previous_erro
         
         long current_error = (long)decoded_pcm - (long)raw_sample;
         
+        // Calculate smoothed error for this path (Noise Shaping)
+        // Alpha 0.15 tracks the vocal range
+        float current_smoothed_error = previous_smoothed_error + 0.15f * ((float)current_error - previous_smoothed_error);
+
         float absolute_error = fabsf((float)current_error);
         float volatility_error = fabsf((float)current_error - (float)previous_error);
+        
+        // Base Score
         float current_step_score = (ERROR_WEIGHT_ABSOLUTE * absolute_error) + (ERROR_WEIGHT_VOLATILITY * volatility_error);
+        
+        // Vocal Priority Penalty (Noise Shaping)
+        // Penalize error that accumulates in the low frequencies
+        if (vocalPriorityFactor > 0.0f) {
+            current_step_score += vocalPriorityFactor * fabsf(current_smoothed_error);
+        }
 
         // Recurse to find the best possible score for the rest of the path
-        float future_score = find_best_future_score(sample_index + 1, depth + 1, current_error, next_step_size, next_history);
+        float future_score = find_best_future_score(sample_index + 1, depth + 1, current_error, current_smoothed_error, next_step_size, next_history);
         
         float total_path_score = current_step_score + future_score;
 
@@ -386,7 +555,7 @@ float find_best_future_score(int64_t sample_index, int depth, long previous_erro
 
 
 // Top-level lookahead function that uses an exhaustive recursive search to find the best ADPCM value.
-uint8_t encodesample_ym2_lookahead (int64_t current_sample_index, int16_t CurrentRawSample, long lookbehind_error)
+uint8_t encodesample_ym2_lookahead (int64_t current_sample_index, int16_t CurrentRawSample, long lookbehind_error, float lookbehind_smoothed_error)
 {
     uint8_t best_adpcm_for_current_sample = 0;
     float min_total_score = FLT_MAX;
@@ -412,13 +581,21 @@ uint8_t encodesample_ym2_lookahead (int64_t current_sample_index, int16_t Curren
 
         long current_error = (long)decoded_pcm_current - (long)CurrentRawSample;
 
+        // Noise shaping update for this trial
+        float current_smoothed_error = lookbehind_smoothed_error + 0.15f * ((float)current_error - lookbehind_smoothed_error);
+
         // --- Part 2: Calculate the score for this first step ---
         float absolute_error = fabsf((float)current_error);
         float volatility_error = fabsf((float)current_error - (float)lookbehind_error);
         float current_score = (ERROR_WEIGHT_ABSOLUTE * absolute_error) + (ERROR_WEIGHT_VOLATILITY * volatility_error);
         
+        // Vocal Priority Penalty
+        if (vocalPriorityFactor > 0.0f) {
+            current_score += vocalPriorityFactor * fabsf(current_smoothed_error);
+        }
+
         // --- Part 3: Recursively find the best possible score for the future path ---
-        float future_score = find_best_future_score(current_sample_index + 1, 1, current_error, next_step_size, next_history);
+        float future_score = find_best_future_score(current_sample_index + 1, 1, current_error, current_smoothed_error, next_step_size, next_history);
 
         float total_score = current_score + future_score;
 
@@ -434,16 +611,6 @@ uint8_t encodesample_ym2_lookahead (int64_t current_sample_index, int16_t Curren
     if (normal_adpcm_for_current_sample != best_adpcm_for_current_sample)
         fixcount++;
 
-    // Set the *actual global encoder state* for the chosen path. This is the only
-    // place we modify the real encoder state.
-    encoder_step_size = entry_encoder_step_size; // Not strictly needed, but good practice
-    encoder_history = entry_encoder_history;     // Not strictly needed, but good practice
-    encodesample_ym2(CurrentRawSample); // This is a trick: we don't use the return value,
-                                        // but we call the original encoder to advance the state correctly
-                                        // based on the *chosen* best_adpcm_for_current_sample.
-                                        // Wait, that's not right. The original encoder makes its own choice.
-                                        // I need to advance the state based on MY choice. The decoder does this.
-    
     // Correct way to advance the *encoder's* state based on our decision:
     // The encoder state is just the decoder state. We simulate the decode of our chosen value.
     decoder_step_size = entry_encoder_step_size;
@@ -818,6 +985,230 @@ void apply_hipass_filter_to_buffer (float *buffer, int num_samples, float cutoff
     }
 }
 
+void lowpass_filter_setup (float cutoff_freq_hz, float sample_rate_hz)
+{
+    if (cutoff_freq_hz <= 0.0f || sample_rate_hz <= 0.0f || cutoff_freq_hz >= sample_rate_hz / 2.0f)
+    {
+        lp_alpha = 1.0f; // Invalid params, pass through
+        lp_y_prev = 0.0f;
+        return;
+    }
+    
+    double rc = 1.0 / (2.0 * M_PI * cutoff_freq_hz);
+    double dt = 1.0 / sample_rate_hz;
+    lp_alpha = (float)(dt / (rc + dt));
+    lp_y_prev = 0.0f;
+}
+
+float lowpass_filter_process (float input_sample)
+{
+    float output_sample = lp_y_prev + lp_alpha * (input_sample - lp_y_prev);
+    lp_y_prev = output_sample;
+    return output_sample;
+}
+
+void apply_lowpass_filter_to_buffer (float *buffer, int num_samples, float cutoff_freq_hz, float sample_rate_hz)
+{
+    lowpass_filter_setup(cutoff_freq_hz, sample_rate_hz);
+    int i;
+    for (i = 0; i < num_samples; i++)
+    {
+        buffer[i] = lowpass_filter_process(buffer[i]);
+    }
+}
+
+void apply_dynamic_lowpass_filter (float *buffer, int64_t num_samples, float min_freq, float max_freq, float sample_rate)
+{
+    int64_t i;
+    float envelope = 0.0f;
+    float release = 0.9995f; // Very slow release to avoid "pumping" artifacts on LPF
+    float attack = 0.1f; 
+
+    // Use a simple envelope follower to modulate LPF cutoff
+    for (i = 0; i < num_samples; i++)
+    {
+        float abs_sample = fabsf(buffer[i]);
+        
+        // Normalize sample roughly to 0..1 range for envelope calculation (assuming 32767 peak)
+        float norm_sample = abs_sample / 32767.0f;
+
+        if (norm_sample > envelope)
+            envelope = envelope + attack * (norm_sample - envelope);
+        else
+            envelope = envelope * release;
+
+        // Map envelope (0..1) to frequency (max_freq .. min_freq)
+        // Higher envelope (louder) -> Lower frequency (more filtering)
+        float target_freq = max_freq - (envelope * (max_freq - min_freq));
+        
+        // Clamp
+        if (target_freq < min_freq) target_freq = min_freq;
+        if (target_freq > max_freq) target_freq = max_freq;
+
+        // Update filter alpha for this sample
+        double rc = 1.0 / (2.0 * M_PI * target_freq);
+        double dt = 1.0 / sample_rate;
+        lp_alpha = (float)(dt / (rc + dt));
+
+        // Apply filter
+        buffer[i] = lowpass_filter_process(buffer[i]);
+    }
+}
+
+void apply_slew_limiter (float *buffer, int64_t num_samples, float slew_factor)
+{
+    int64_t i;
+    float max_delta = 32767.0f * slew_factor;
+    
+    // Process forward
+    for (i = 1; i < num_samples; i++)
+    {
+        float delta = buffer[i] - buffer[i-1];
+        if (delta > max_delta)
+        {
+            buffer[i] = buffer[i-1] + max_delta;
+        }
+        else if (delta < -max_delta)
+        {
+            buffer[i] = buffer[i-1] - max_delta;
+        }
+    }
+}
+
+void apply_mid_scoop (float *buffer, int64_t num_samples, float db_cut, float sample_rate)
+{
+    // Standard Peaking EQ Biquad implementation
+    // Center freq: 1000Hz
+    // Q: 1.0 (Wide bandwidth)
+    float f0 = 1000.0f;
+    float Q = 1.0f;
+    float gain = -db_cut; // User supplies positive dB for cut, so invert it.
+    
+    float A = powf(10.0f, gain / 40.0f);
+    float w0 = 2.0f * M_PI * f0 / sample_rate;
+    float alpha = sinf(w0) / (2.0f * Q);
+    float cos_w0 = cosf(w0);
+
+    Biquad bq;
+    
+    float b0 = 1.0f + alpha * A;
+    float b1 = -2.0f * cos_w0;
+    float b2 = 1.0f - alpha * A;
+    float a0 = 1.0f + alpha / A;
+    float a1 = -2.0f * cos_w0;
+    float a2 = 1.0f - alpha / A;
+
+    // Normalize coefficients
+    bq.b0 = b0 / a0;
+    bq.b1 = b1 / a0;
+    bq.b2 = b2 / a0;
+    bq.a1 = a1 / a0;
+    bq.a2 = a2 / a0;
+    
+    bq.z1 = 0.0f;
+    bq.z2 = 0.0f;
+
+    int64_t i;
+    for (i = 0; i < num_samples; i++)
+    {
+        float in = buffer[i];
+        float out = bq.b0 * in + bq.z1;
+        bq.z1 = bq.b1 * in + bq.z2 - bq.a1 * out;
+        bq.z2 = bq.b2 * in - bq.a2 * out;
+        buffer[i] = out;
+    }
+}
+
+void apply_compressor (float *buffer, int64_t num_samples, float ratio, float threshold_db, float sample_rate)
+{
+    // Simple Feed-Forward Compressor
+    // Threshold: threshold_db relative to 32767
+    // Attack: 5ms
+    // Release: 100ms
+    
+    float threshold_linear = powf(10.0f, threshold_db / 20.0f) * 32767.0f;
+    float envelope = 0.0f;
+    float attack_time = 0.005f; 
+    float release_time = 0.100f; 
+    
+    float ga = expf(-1.0f / (sample_rate * attack_time));
+    float gr = expf(-1.0f / (sample_rate * release_time));
+
+    int64_t i;
+    for (i = 0; i < num_samples; i++)
+    {
+        float abs_sample = fabsf(buffer[i]);
+        
+        // Envelope Follower
+        if (abs_sample > envelope) 
+            envelope = ga * envelope + (1.0f - ga) * abs_sample;
+        else 
+            envelope = gr * envelope + (1.0f - gr) * abs_sample;
+
+        // Gain Reduction
+        if (envelope > threshold_linear) {
+            // Convert envelope to dB relative to threshold
+            float over_db = 20.0f * log10f(envelope / threshold_linear);
+            
+            // Calculate gain reduction in dB
+            float gain_reduction_db = over_db * (1.0f - 1.0f/ratio);
+            
+            // Convert to linear gain
+            float gain = powf(10.0f, -gain_reduction_db / 20.0f);
+            
+            buffer[i] *= gain;
+        }
+    }
+    
+    // Normalize back to peak to maximize bit usage
+    normalize_buffer_to_peak(buffer, num_samples, 32767.0f);
+}
+
+void normalize_buffer_to_peak (float *buffer, int64_t num_samples, float target_peak)
+{
+    int64_t i;
+    float current_peak = 0.0f;
+    
+    for (i = 0; i < num_samples; i++) {
+        if (fabsf(buffer[i]) > current_peak) current_peak = fabsf(buffer[i]);
+    }
+    
+    if (current_peak > 0.0f) {
+        float gain = target_peak / current_peak;
+        for (i = 0; i < num_samples; i++) buffer[i] *= gain;
+    }
+}
+
+
+void apply_soft_clip_to_buffer (float *buffer, int64_t num_samples)
+{
+    int64_t i;
+    float peak = 0.0f;
+    float drive = 1.5f; // Slight drive to force saturation
+
+    // Apply tanh with drive
+    for (i = 0; i < num_samples; i++)
+    {
+        // Normalize to -1..1 range, apply drive, then tanh
+        float s = buffer[i] / 32767.0f;
+        s = tanhf(s * drive);
+        buffer[i] = s * 32767.0f;
+
+        if (fabsf(buffer[i]) > peak)
+            peak = fabsf(buffer[i]);
+    }
+
+    // Re-normalize to maximize dynamic range after clipping
+    if (peak > 0.0f)
+    {
+        float makeup_gain = 32767.0f / peak;
+        for (i = 0; i < num_samples; i++)
+        {
+            buffer[i] *= makeup_gain;
+        }
+    }
+}
+
 float returnMedianValue (float a, float b, float c, float d, float e)
 {
     float sorted_arr[5];
@@ -883,12 +1274,23 @@ void restore_decoder_state (void)
 void usage (char *programname)
 {
     fprintf (stderr, "%s %s %s\n", PROGNAME, __DATE__, __TIME__);
-    fprintf (stderr, "Usage: %s -i INPUTFILE -o OUTFILE [-r RATE | -R]\n", programname);
+    fprintf (stderr, "Usage: %s -i INPUTFILE -o OUTFILE [-r RATE | -R] [options]\n", programname);
     fprintf (stderr, "\n");
     fprintf (stderr, "    Options for specifying input and output format details.\n");
     fprintf (stderr, "       -i specifies the input file. (WAV, MP3, OGG, etc.)\n");
     fprintf (stderr, "       -o specifies the output file name.\n");
     fprintf (stderr, "       -r specifies the output bitrate in samples/second. (Default: %ld)\n", TARGETRATE);
     fprintf (stderr, "       -R uses the input sample bitrate as the encoding rate.\n");
+    fprintf (stderr, "\n    Pre-processing Options:\n");
+    fprintf (stderr, "       -p <PRESET> Load a preset configuration (music, deep, speech).\n");
+    fprintf (stderr, "       -C <RATIO>  Compressor. Limits dynamic range with RATIO (e.g. 4.0).\n");
+    fprintf (stderr, "       -M <DB>     Mid-Range Scoop. Cuts 1kHz by DB amount (e.g. 6.0).\n");
+    fprintf (stderr, "       -V <FACTOR> Vocal Priority. Penalizes drift to keep vocals clear (e.g. 5.0).\n");
+    fprintf (stderr, "       -s          Enable Soft Clipping (Tanh Limiter).\n");
+    fprintf (stderr, "       -l <FREQ>   Static Low-Pass Filter at FREQ (Hz).\n");
+    fprintf (stderr, "       -D <MIN,MAX> Dynamic Low-Pass Filter. (e.g. 3000,12000)\n");
+    fprintf (stderr, "       -S <FACTOR> Slew Rate Limiter. (e.g. 0.20)\n");
+    fprintf (stderr, "\n    Encoder Options:\n");
+    fprintf (stderr, "       -L <DEPTH>  Lookahead Depth (1-%d). Default 3. Higher is slower but better.\n", MAX_LOOKAHEAD_DEPTH);
     fprintf (stderr, "\n");
 }

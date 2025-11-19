@@ -1,4 +1,4 @@
-#define PROGNAME "CLEANYM2 Decoder v1.0, by Mike Saarna. 2025."
+#define PROGNAME "CLEANYM2 Decoder v1.1, by Mike Saarna. 2025."
 
 #include <stdio.h>
 #include <stdlib.h>
